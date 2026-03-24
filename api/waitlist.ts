@@ -13,12 +13,17 @@ declare const process: {
     RESEND_API_KEY?: string;
     OWNER_EMAIL?: string;
     FROM_EMAIL?: string;
+    WAITLIST_DEBUG?: string;
   };
 };
 
 import { Resend } from "resend";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resend = process.env.RESEND_API_KEY
+  ? new Resend(process.env.RESEND_API_KEY)
+  : null;
+
+const DEBUG = process.env.WAITLIST_DEBUG === "1";
 
 type Req = {
   method: string;
@@ -30,7 +35,7 @@ type ResLike = {
   status: (code: number) => { json: (payload: ResponseData) => void };
 };
 
-type ResponseData = { success: true } | { error: string };
+type ResponseData = { success: true } | { error: string; details?: string };
 
 function isValidEmail(email: string): boolean {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -65,11 +70,24 @@ export default async function handler(req: Req, res: ResLike): Promise<void> {
     }
 
     // Send confirmation email to user
-    const userEmailResult = await resend.emails.send({
-      from: process.env.FROM_EMAIL || "noreply@wally.ai",
-      to: normalizedEmail,
-      subject: "You're on the Wally waitlist!",
-      html: `
+    if (!resend) {
+      console.error("RESEND_API_KEY is not configured");
+      const details = DEBUG ? "RESEND_API_KEY missing or empty" : undefined;
+      return res
+        .status(500)
+        .json(
+          details
+            ? { error: "Email service not configured", details }
+            : { error: "Email service not configured" },
+        );
+    }
+
+    try {
+      await resend.emails.send({
+        from: process.env.FROM_EMAIL || "noreply@wally.ai",
+        to: normalizedEmail,
+        subject: "You're on the Wally waitlist!",
+        html: `
         <!DOCTYPE html>
         <html>
           <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.6; color: #333;">
@@ -97,26 +115,33 @@ export default async function handler(req: Req, res: ResLike): Promise<void> {
           </body>
         </html>
       `,
-    });
-
-    if (userEmailResult.error) {
-      console.error(
-        "Failed to send user confirmation email:",
-        userEmailResult.error,
-      );
+      });
+    } catch (err) {
+      console.error("Failed to send user confirmation email:", err);
+      const details = DEBUG ? String(err) : undefined;
       return res
         .status(500)
-        .json({ error: "Failed to send confirmation email" });
+        .json(
+          details
+            ? { error: "Failed to send confirmation email", details }
+            : { error: "Failed to send confirmation email" },
+        );
     }
 
-    // Send notification email to owner
+    // Send notification email to owner (best-effort)
     const ownerEmail = process.env.OWNER_EMAIL;
     if (ownerEmail) {
-      const ownerEmailResult = await resend.emails.send({
-        from: process.env.FROM_EMAIL || "noreply@wally.ai",
-        to: ownerEmail,
-        subject: "New Wally waitlist signup",
-        html: `
+      if (!resend) {
+        console.warn(
+          "Owner notification skipped: RESEND_API_KEY not configured",
+        );
+      } else {
+        try {
+          await resend.emails.send({
+            from: process.env.FROM_EMAIL || "noreply@wally.ai",
+            to: ownerEmail,
+            subject: "New Wally waitlist signup",
+            html: `
           <!DOCTYPE html>
           <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.6; color: #333;">
@@ -128,20 +153,24 @@ export default async function handler(req: Req, res: ResLike): Promise<void> {
             </body>
           </html>
         `,
-      });
-
-      if (ownerEmailResult.error) {
-        console.warn(
-          "Failed to send owner notification email:",
-          ownerEmailResult.error,
-        );
-        // Don't fail the request if owner email fails — user confirmation already sent
+          });
+        } catch (err) {
+          console.warn("Failed to send owner notification email:", err);
+          // Don't fail the request if owner notification fails — user confirmation already sent
+        }
       }
     }
 
     res.status(200).json({ success: true });
   } catch (error) {
     console.error("Waitlist error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    const details = DEBUG ? String(error) : undefined;
+    res
+      .status(500)
+      .json(
+        details
+          ? { error: "Internal server error", details }
+          : { error: "Internal server error" },
+      );
   }
 }
